@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	
+	"time"
+
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
@@ -73,9 +75,10 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 	r := managed.NewReconciler(mgr,
 		resource.ManagedKind(v1alpha1.PortOrderGroupVersionKind),
 		managed.WithExternalConnecter(&connector{
-			kube:   mgr.GetClient(),
-			usage:  resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
-			logger: logging.NewLogrLogger(mgr.GetLogger().WithName("portorder")),
+			kube:            mgr.GetClient(),
+			usage:           resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
+			logger:          o.Logger,
+			newHttpClientFn: httpclient.NewClient,
 		}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
@@ -94,9 +97,10 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 // connector is expected to produce an ExternalClient when its Connect method
 // is called.
 type connector struct {
-	kube   client.Client
-	usage  resource.Tracker
-	logger logging.Logger
+	kube            client.Client
+	usage           resource.Tracker
+	logger          logging.Logger
+	newHttpClientFn func(log logging.Logger, timeout time.Duration, creds string) (httpclient.Client, error)
 }
 
 // Connect produces an ExternalClient for PortOrder resources.
@@ -106,19 +110,25 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.New(errNotPortOrder)
 	}
 
+	l := c.logger.WithValues("portOrder", cr.Name)
+
 	if err := c.usage.Track(ctx, mg); err != nil {
 		return nil, errors.Wrap(err, errTrackPCUsage)
 	}
 
 	pc := &apisv1alpha1.ProviderConfig{}
-	if err := c.kube.Get(ctx, types.NamespacedName{Name: cr.GetProviderConfigReference().Name}, pc); err != nil {
+	n := types.NamespacedName{Name: cr.GetProviderConfigReference().Name}
+	if err := c.kube.Get(ctx, n, pc); err != nil {
 		return nil, errors.Wrap(err, errGetPC)
 	}
 
-	cd := pc.Spec.Credentials
-	data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
-	if err != nil {
-		return nil, errors.Wrap(err, errGetCreds)
+	var creds string = ""
+	if pc.Spec.Credentials.Source == xpv1.CredentialsSourceSecret {
+		data, err := resource.CommonCredentialExtractor(ctx, pc.Spec.Credentials.Source, c.kube, pc.Spec.Credentials.CommonCredentialSelectors)
+		if err != nil {
+			return nil, errors.Wrap(err, errGetCreds)
+		}
+		creds = string(data)
 	}
 
 	// Parse credentials to get auth info
@@ -126,31 +136,30 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		AuthType    string            `json:"authType,omitempty"`
 		Credentials string            `json:"credentials,omitempty"`
 		Headers     map[string]string `json:"headers,omitempty"`
+		Timeout     *time.Duration    `json:"timeout,omitempty"`
 	}{}
 
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &config); err != nil {
+	if len(creds) > 0 {
+		if err := json.Unmarshal([]byte(creds), &config); err != nil {
 			return nil, errors.Wrap(err, "failed to parse credentials")
 		}
 	}
 
-	// Create HTTP client with authentication
-	opts := []httpclient.ClientOption{
-		httpclient.WithMiddleware(httpclient.LoggingMiddleware()),
-		httpclient.WithMiddleware(httpclient.JSONMiddleware()),
+	// Default timeout
+	timeout := 30 * time.Second
+	if config.Timeout != nil {
+		timeout = *config.Timeout
 	}
 
-	if config.AuthType != "" && config.Credentials != "" {
-		opts = append(opts, httpclient.WithMiddleware(
-			httpclient.AuthMiddleware(config.AuthType, config.Credentials),
-		))
+	// Create HTTP client
+	h, err := c.newHttpClientFn(l, timeout, creds)
+	if err != nil {
+		return nil, errors.Wrap(err, errNewClient)
 	}
-
-	httpClient := httpclient.NewClient(opts...)
 
 	return &external{
-		client:         httpClient,
-		logger:         c.logger,
+		client:         h,
+		logger:         l,
 		defaultHeaders: config.Headers,
 	}, nil
 }
@@ -214,38 +223,38 @@ func (e *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	}
 	headers["X-Request-ID"] = fmt.Sprintf("crossplane-%s", cr.GetUID())
 
-	// Create the HTTP request
-	req := &httpclient.Request{
-		URL:     cr.Spec.ForProvider.APIEndpoint,
-		Method:  "POST",
-		Headers: headers,
-		Body:    body,
-		RetryPolicy: &httpclient.RetryPolicy{
-			MaxAttempts:    3,
-			BackoffSeconds: 2,
-		},
-	}
+	// Create the HTTP request using the client's SendRequest method
+	bodyData := httpclient.Data{Encrypted: nil, Decrypted: string(body)}
+	headersData := httpclient.Data{Encrypted: nil, Decrypted: headers}
 
 	// Execute the request
-	resp, err := e.client.Do(ctx, req)
+	details, err := e.client.SendRequest(
+		ctx,
+		"POST",
+		cr.Spec.ForProvider.APIEndpoint,
+		bodyData,
+		headersData,
+		false, // InsecureSkipTLSVerify
+	)
+
 	if err != nil {
 		return managed.ExternalCreation{}, errors.Wrap(err, "failed to create order")
 	}
 
 	// Update status
-	now := meta.Now()
+	now := metav1.Now()
 	cr.Status.AtProvider.LastRequestTime = &now
-	cr.Status.AtProvider.LastResponseStatus = resp.StatusCode
+	cr.Status.AtProvider.LastResponseStatus = details.HttpResponse.StatusCode
 
 	// Check if request was successful
-	if resp.StatusCode != 201 && resp.StatusCode != 200 {
-		return managed.ExternalCreation{}, errors.Errorf("unexpected status code: %d, body: %s", 
-			resp.StatusCode, string(resp.Body))
+	if details.HttpResponse.StatusCode != 201 && details.HttpResponse.StatusCode != 200 {
+		return managed.ExternalCreation{}, errors.Errorf("unexpected status code: %d, body: %s",
+			details.HttpResponse.StatusCode, string(details.HttpResponse.Body))
 	}
 
 	// Parse response to get order ID
 	var orderResp OrderResponse
-	if err := json.Unmarshal(resp.Body, &orderResp); err != nil {
+	if err := json.Unmarshal(details.HttpResponse.Body, &orderResp); err != nil {
 		return managed.ExternalCreation{}, errors.Wrap(err, errUnmarshal)
 	}
 
